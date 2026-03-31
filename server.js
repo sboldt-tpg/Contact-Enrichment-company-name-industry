@@ -186,7 +186,7 @@ EMAIL DOMAIN: ${job.domain}
 KNOWN COMPANY NAME: ${job.company || 'Not provided'}
 
 TASK 1 — COMPANY NAME:
-Based on the email domain, identify the full legal or common company name. Examples: "Salesforce", "Johns Hopkins Medicine", "CBRE Group", "Deloitte". Make your best inference from the domain. Do not say "Unknown".
+Based on the email domain, identify the company name. Use the name the company is most commonly known by in the business world. If the company is more widely recognized by its acronym or shortened name, use that instead of the full legal name. Examples: "IBM" not "International Business Machines", "CAS" not "Chemical Abstracts Service", "KPMG" not "Klynveld Peat Marwick Goerdeler", "HP" not "Hewlett-Packard", "3M" not "Minnesota Mining and Manufacturing". If the full name is equally or more recognized, use that instead. Do not say "Unknown".
 
 TASK 2 — INDUSTRY:
 Based on the email domain, write a concise, specific industry label (3-6 words). Examples: "Cloud Infrastructure Software", "Commercial Real Estate Brokerage", "Digital Marketing Agency", "Community Hospital System". Be specific.
