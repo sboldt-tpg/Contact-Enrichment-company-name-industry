@@ -53,6 +53,12 @@ const PROCESS_INTERVAL_MS = 500;
 
 let stats = { processed: 0, skipped: 0, failed: 0 };
 
+// Reset processed count every 30 minutes
+setInterval(() => {
+  stats.processed = 0;
+  console.log('🔄 Enriched count reset');
+}, 30 * 60 * 1000);
+
 // =============================
 // HEALTH CHECK
 // =============================
@@ -145,12 +151,12 @@ async function processJob(job) {
   try {
     console.log(`🔍 Enriching: ${job.email}`);
 
-    const { industry, industryCategory } = await runClaude(job);
+    const { companyName, industry, industryCategory } = await runClaude(job);
 
-    await writeToHubSpot(job.contactId, industry, industryCategory);
+    await writeToHubSpot(job.contactId, companyName, industry, industryCategory);
 
     stats.processed++;
-    console.log(`✅ ${job.email} → "${industry}" / "${industryCategory}"`);
+    console.log(`✅ ${job.email} → "${companyName}" / "${industry}" / "${industryCategory}"`);
 
   } catch (err) {
     console.error(`❌ Failed: ${job.email} — ${err.message}`);
@@ -179,10 +185,13 @@ async function runClaude(job) {
 EMAIL DOMAIN: ${job.domain}
 KNOWN COMPANY NAME: ${job.company || 'Not provided'}
 
-TASK 1 — INDUSTRY:
-Based on the email domain, identify the company and write a concise, specific industry label (3-6 words). Examples: "Cloud Infrastructure Software", "Commercial Real Estate Brokerage", "Digital Marketing Agency", "Community Hospital System". Be specific. Make your best inference from the domain — do not say "Unknown".
+TASK 1 — COMPANY NAME:
+Based on the email domain, identify the full legal or common company name. Examples: "Salesforce", "Johns Hopkins Medicine", "CBRE Group", "Deloitte". Make your best inference from the domain. Do not say "Unknown".
 
-TASK 2 — INDUSTRY CATEGORY:
+TASK 2 — INDUSTRY:
+Based on the email domain, write a concise, specific industry label (3-6 words). Examples: "Cloud Infrastructure Software", "Commercial Real Estate Brokerage", "Digital Marketing Agency", "Community Hospital System". Be specific.
+
+TASK 3 — INDUSTRY CATEGORY:
 Map the industry to EXACTLY one of these categories (copy the label exactly as written):
 - Technology & Software
 - Healthcare & Life Sciences
@@ -197,6 +206,7 @@ Map the industry to EXACTLY one of these categories (copy the label exactly as w
 - Other
 
 RESPOND IN THIS EXACT FORMAT, nothing else:
+COMPANY: <full company name>
 INDUSTRY: <specific industry label>
 CATEGORY: <exact category from the list>`;
 
@@ -221,32 +231,36 @@ CATEGORY: <exact category from the list>`;
 
   const text = res.data?.content?.find(p => p.type === 'text')?.text || '';
 
+  const companyMatch   = text.match(/^COMPANY:\s*(.+)$/mi);
   const industryMatch  = text.match(/^INDUSTRY:\s*(.+)$/mi);
   const categoryMatch  = text.match(/^CATEGORY:\s*(.+)$/mi);
 
-  const industry = industryMatch ? industryMatch[1].trim() : 'Unknown';
+  const companyName    = companyMatch  ? companyMatch[1].trim()  : '';
+  const industry       = industryMatch ? industryMatch[1].trim() : 'Unknown';
   let industryCategory = categoryMatch ? categoryMatch[1].trim() : 'Other';
 
-  // Safety — ensure category is always from the approved list
   if (!INDUSTRY_CATEGORIES.includes(industryCategory)) {
     industryCategory = 'Other';
   }
 
-  return { industry, industryCategory };
+  return { companyName, industry, industryCategory };
 }
 
 // =============================
 // WRITE BACK TO HUBSPOT
 // =============================
-async function writeToHubSpot(contactId, industry, industryCategory) {
+async function writeToHubSpot(contactId, companyName, industry, industryCategory) {
+  const properties = {
+    industry,
+    industry_category: industryCategory
+  };
+
+  // Only write company if HubSpot field is blank — don't overwrite existing data
+  if (companyName) properties.company = companyName;
+
   await axios.patch(
     `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`,
-    {
-      properties: {
-        industry,
-        industry_category: industryCategory
-      }
-    },
+    { properties },
     {
       headers: {
         Authorization: `Bearer ${HUBSPOT_TOKEN}`,
