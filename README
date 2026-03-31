@@ -1,0 +1,49 @@
+TPG Contact Enrichment Service
+
+A lightweight Node.js service that runs on Render and enriches HubSpot contacts
+with industry and industry category data based on their email domain.
+
+HOW IT WORKS
+
+1. A HubSpot workflow triggers when a contact meets your enrollment criteria
+2. A custom code step sends the contact's email and company to this service
+3. The service skips personal email addresses (Gmail, Yahoo, Outlook, etc.)
+4. For business emails, Claude identifies the company and specific industry
+   from the email domain
+5. Claude maps the industry to one of 10 standard categories
+6. The service writes industry and industry_category back to the HubSpot contact
+
+INDUSTRY CATEGORIES
+
+  - Technology & Software
+  - Healthcare & Life Sciences
+  - Financial Services & Fintech
+  - Real Estate & Construction
+  - Marketing, Media & Advertising
+  - Energy, Industrial & Manufacturing
+  - Professional Services & Consulting
+  - Nonprofit, Government & Public Sector
+  - Retail, Food & Consumer Goods
+  - Education
+  - Other
+
+ENDPOINTS
+
+  POST /enrich        Accepts a contact from HubSpot and queues for processing
+  GET  /dashboard     Live monitor showing queue, in-flight, and stats
+  GET  /              JSON health check
+
+ENVIRONMENT VARIABLES (set in Render)
+
+  HUBSPOT_TOKEN       Your HubSpot private app access token
+  ANTHROPIC_API_KEY   Your Anthropic API key
+
+HUBSPOT CONTACT PROPERTIES WRITTEN
+
+  industry            Specific industry label (e.g. "Cloud Infrastructure Software")
+  industry_category   Standardized category from the list above
+
+HUBSPOT WORKFLOW SETUP
+
+  Custom code step language: Node.js 20.x
+  Input properties required: email, company
