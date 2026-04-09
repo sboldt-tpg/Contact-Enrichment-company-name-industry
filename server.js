@@ -10,10 +10,10 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 // =============================
 // CONFIG — Tuned for Anthropic Tier 4 + Render $7
 // =============================
-const CONCURRENCY        = 50;   // 50 parallel Claude calls — safe under Tier 4 (4000 RPM)
-const PROCESS_INTERVAL   = 100;  // Check queue every 100ms for fast draining
-const HUBSPOT_CONCURRENCY = 20;  // Parallel HubSpot write-backs
-const MAX_RETRIES        = 3;
+const CONCURRENCY         = 25;   // Conservative — avoids Tier 4 rate limits
+const PROCESS_INTERVAL    = 100;  // Check queue every 100ms
+const HUBSPOT_CONCURRENCY = 20;   // Parallel HubSpot write-backs
+const MAX_RETRIES         = 3;
 
 // =============================
 // FREE EMAIL DOMAINS — skip these
@@ -53,8 +53,10 @@ const INDUSTRY_CATEGORIES = [
 
 // =============================
 // DOMAIN CACHE — avoid duplicate Claude calls for same domain
+// domainCache stores: { companyName, industry } — the raw enrichment data
+// industryCategory is always derived fresh from whatever industry we end up using
 // =============================
-const domainCache = new Map(); // domain -> { companyName, industry, industryCategory }
+const domainCache = new Map();
 
 // =============================
 // QUEUE & STATS
@@ -64,13 +66,14 @@ let inFlight = 0;
 let hsInFlight = 0;
 
 let stats = {
-  processed: 0,
-  skipped:   0,
-  failed:    0,
-  cacheHits: 0
+  processed:    0,
+  skipped:      0,
+  failed:       0,
+  cacheHits:    0,
+  companyKept:  0,  // had company already — skipped that lookup
+  industryKept: 0   // had industry already — skipped that lookup
 };
 
-// Reset enriched count every 30 minutes
 setInterval(() => {
   stats.processed = 0;
   console.log('🔄 Enriched count reset');
@@ -94,7 +97,6 @@ app.get('/', (req, res) => {
 // DASHBOARD
 // =============================
 app.get('/dashboard', (req, res) => {
-  const rate = stats.processed + stats.skipped + stats.failed;
   res.send(`
     <!DOCTYPE html>
     <html>
@@ -111,6 +113,7 @@ app.get('/dashboard', (req, res) => {
         .green { color: #a2cf23; } .teal { color: #23cfb0; }
         .orange { color: #f0a500; } .red { color: #e05252; }
         .grey { color: #333; } .blue { color: #238acf; }
+        .yellow { color: #f0d500; }
         .section { margin-bottom: 32px; }
         .section-title { font-size: 11px; color: #444; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 14px; border-bottom: 1px solid #1a1a1a; padding-bottom: 6px; }
         .footer { font-size: 12px; color: #333; margin-top: 40px; border-top: 1px solid #1a1a1a; padding-top: 20px; }
@@ -133,8 +136,10 @@ app.get('/dashboard', (req, res) => {
         <div class="section-title">Session Totals</div>
         <div class="grid">
           <div><div class="stat green">${stats.processed}</div><div class="label">enriched</div></div>
-          <div><div class="stat teal">${stats.skipped}</div><div class="label">skipped</div></div>
+          <div><div class="stat teal">${stats.skipped}</div><div class="label">skipped (personal email)</div></div>
           <div><div class="stat blue">${stats.cacheHits}</div><div class="label">cache hits</div></div>
+          <div><div class="stat yellow">${stats.companyKept}</div><div class="label">company pre-filled</div></div>
+          <div><div class="stat yellow">${stats.industryKept}</div><div class="label">industry pre-filled</div></div>
           <div><div class="stat ${stats.failed > 0 ? 'red' : 'grey'}">${stats.failed}</div><div class="label">failed</div></div>
         </div>
       </div>
@@ -149,7 +154,8 @@ app.get('/dashboard', (req, res) => {
 // ENQUEUE ENDPOINT
 // =============================
 app.post('/enrich', (req, res) => {
-  const { contactId, email, company } = req.body;
+  // Accept company and industry from the workflow so we know what's already filled
+  const { contactId, email, company, industry, industry_category } = req.body;
 
   if (!contactId || !email) {
     return res.status(400).json({ error: 'contactId and email are required' });
@@ -166,7 +172,16 @@ app.post('/enrich', (req, res) => {
     return res.status(200).json({ status: 'skipped', reason: 'personal_email_domain' });
   }
 
-  queue.push({ contactId, email, domain, company: company || '', retries: 0 });
+  queue.push({
+    contactId,
+    email,
+    domain,
+    existingCompany:          company           ? company.trim()           : '',
+    existingIndustry:         industry          ? industry.trim()          : '',
+    existingIndustryCategory: industry_category ? industry_category.trim() : '',
+    retries: 0
+  });
+
   res.status(200).json({ status: 'queued', position: queue.length });
 });
 
@@ -186,30 +201,54 @@ setInterval(() => {
 // =============================
 async function processJob(job) {
   try {
-    let result;
+    // Determine what we actually need to look up
+    const needsCompany  = !job.existingCompany;
+    const needsIndustry = !job.existingIndustry;
 
-    // Use cache if we've already looked up this domain
-    if (domainCache.has(job.domain)) {
-      result = domainCache.get(job.domain);
-      stats.cacheHits++;
-      console.log(`💾 Cache hit: ${job.domain}`);
-    } else {
-      result = await runClaude(job);
-      domainCache.set(job.domain, result);
+    let companyName      = job.existingCompany;
+    let industry         = job.existingIndustry;
+
+    if (!needsCompany)  stats.companyKept++;
+    if (!needsIndustry) stats.industryKept++;
+
+    // Only call Claude if we need at least one of the two fields
+    if (needsCompany || needsIndustry) {
+      if (domainCache.has(job.domain)) {
+        // Pull from cache — take only the fields we actually need
+        const cached = domainCache.get(job.domain);
+        if (needsCompany  && cached.companyName) companyName = cached.companyName;
+        if (needsIndustry && cached.industry)    industry    = cached.industry;
+        stats.cacheHits++;
+        console.log(`💾 Cache hit: ${job.domain} (company=${!needsCompany ? 'kept' : 'from cache'}, industry=${!needsIndustry ? 'kept' : 'from cache'})`);
+      } else {
+        // Ask Claude only for what's missing
+        const result = await runClaude(job, needsCompany, needsIndustry);
+        if (needsCompany)  companyName = result.companyName;
+        if (needsIndustry) industry    = result.industry;
+
+        // Cache the raw enrichment data for this domain
+        domainCache.set(job.domain, {
+          companyName: needsCompany  ? result.companyName : '',
+          industry:    needsIndustry ? result.industry    : ''
+        });
+      }
     }
 
-    const { companyName, industry, industryCategory } = result;
+    // Industry category — skip if already filled, otherwise derive from industry
+    const industryCategory = job.existingIndustryCategory
+      ? job.existingIndustryCategory
+      : await getIndustryCategory(industry, job.domain);
 
-    await writeToHubSpot(job.contactId, companyName, industry, industryCategory);
+    const categoryChanged = !job.existingIndustryCategory;
+    await writeToHubSpot(job.contactId, needsCompany ? companyName : null, needsIndustry ? industry : null, categoryChanged ? industryCategory : null);
 
     stats.processed++;
-    console.log(`✅ ${job.email} → "${companyName}" / "${industry}" / "${industryCategory}"`);
+    console.log(`✅ ${job.email} → company="${needsCompany ? companyName : '(kept)'}" / industry="${needsIndustry ? industry : '(kept)'}" / category="${industryCategory}"`);
 
   } catch (err) {
     console.error(`❌ Failed: ${job.email} — ${err.message}`);
 
     if (err.response?.status === 429) {
-      // Rate limited — back off and requeue
       setTimeout(() => queue.push(job), 2000);
     } else {
       job.retries = (job.retries || 0) + 1;
@@ -227,43 +266,40 @@ async function processJob(job) {
 
 // =============================
 // CLAUDE — IDENTIFY COMPANY + INDUSTRY
+// Only asks for the fields that are actually missing
 // =============================
-async function runClaude(job) {
+async function runClaude(job, needsCompany, needsIndustry) {
+  // Build the prompt dynamically based on what we need
+  const tasks = [];
+
+  if (needsCompany) {
+    tasks.push(`TASK: COMPANY NAME
+Based on the email domain, identify the company name. Use the name the company is most commonly known by in the business world. Prefer commonly known acronyms over full legal names (e.g. "IBM" not "International Business Machines", "HP" not "Hewlett-Packard", "KPMG" not "Klynveld Peat Marwick Goerdeler"). Do not say "Unknown".`);
+  }
+
+  if (needsIndustry) {
+    tasks.push(`TASK: INDUSTRY
+Based on the email domain, write a concise, specific industry label (3–6 words). Examples: "Cloud Infrastructure Software", "Commercial Real Estate Brokerage", "Digital Marketing Agency", "Community Hospital System". Be specific.`);
+  }
+
+  const responseFormat = [];
+  if (needsCompany)  responseFormat.push('COMPANY: <company name>');
+  if (needsIndustry) responseFormat.push('INDUSTRY: <specific industry label>');
+
   const prompt = `You are a B2B data enrichment assistant.
 
 EMAIL DOMAIN: ${job.domain}
-KNOWN COMPANY NAME: ${job.company || 'Not provided'}
 
-TASK 1 — COMPANY NAME:
-Based on the email domain, identify the company name. Use the name the company is most commonly known by in the business world. If the company is more widely recognized by its acronym or shortened name, use that instead of the full legal name. Examples: "IBM" not "International Business Machines", "CAS" not "Chemical Abstracts Service", "KPMG" not "Klynveld Peat Marwick Goerdeler", "HP" not "Hewlett-Packard", "3M" not "Minnesota Mining and Manufacturing". If the full name is equally or more recognized, use that instead. Do not say "Unknown".
-
-TASK 2 — INDUSTRY:
-Based on the email domain, write a concise, specific industry label (3-6 words). Examples: "Cloud Infrastructure Software", "Commercial Real Estate Brokerage", "Digital Marketing Agency", "Community Hospital System". Be specific.
-
-TASK 3 — INDUSTRY CATEGORY:
-Map the industry to EXACTLY one of these categories (copy the label exactly as written):
-- Technology & Software
-- Healthcare & Life Sciences
-- Financial Services & Fintech
-- Real Estate & Construction
-- Marketing, Media & Advertising
-- Energy, Industrial & Manufacturing
-- Professional Services & Consulting
-- Nonprofit, Government & Public Sector
-- Retail, Food & Consumer Goods
-- Education
-- Other
+${tasks.join('\n\n')}
 
 RESPOND IN THIS EXACT FORMAT, nothing else:
-COMPANY: <company name>
-INDUSTRY: <specific industry label>
-CATEGORY: <exact category from the list>`;
+${responseFormat.join('\n')}`;
 
   const res = await axios.post(
     'https://api.anthropic.com/v1/messages',
     {
-      model: 'claude-haiku-4-5-20251001', // Haiku — faster and cheaper for structured lookups
-      max_tokens: 100,
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 80,
       temperature: 0,
       system: 'You are a precise B2B data enrichment assistant. Respond only in the exact format requested. No preamble or explanation.',
       messages: [{ role: 'user', content: prompt }]
@@ -282,31 +318,82 @@ CATEGORY: <exact category from the list>`;
 
   const companyMatch  = text.match(/^COMPANY:\s*(.+)$/mi);
   const industryMatch = text.match(/^INDUSTRY:\s*(.+)$/mi);
-  const categoryMatch = text.match(/^CATEGORY:\s*(.+)$/mi);
 
-  const companyName    = companyMatch  ? companyMatch[1].trim()  : '';
-  const industry       = industryMatch ? industryMatch[1].trim() : 'Unknown';
-  let industryCategory = categoryMatch ? categoryMatch[1].trim() : 'Other';
+  return {
+    companyName: companyMatch  ? companyMatch[1].trim()  : '',
+    industry:    industryMatch ? industryMatch[1].trim() : 'Unknown'
+  };
+}
 
-  if (!INDUSTRY_CATEGORIES.includes(industryCategory)) {
-    industryCategory = 'Other';
+// =============================
+// CLAUDE — CATEGORIZE INDUSTRY
+// Separate, lightweight call — always runs so category stays in sync
+// =============================
+async function getIndustryCategory(industry, domain) {
+  const prompt = `You are a B2B data enrichment assistant.
+
+INDUSTRY: ${industry}
+EMAIL DOMAIN: ${domain}
+
+Map this industry to EXACTLY one of these categories (copy the label exactly as written):
+- Technology & Software
+- Healthcare & Life Sciences
+- Financial Services & Fintech
+- Real Estate & Construction
+- Marketing, Media & Advertising
+- Energy, Industrial & Manufacturing
+- Professional Services & Consulting
+- Nonprofit, Government & Public Sector
+- Retail, Food & Consumer Goods
+- Education
+- Other
+
+RESPOND IN THIS EXACT FORMAT, nothing else:
+CATEGORY: <exact category from the list>`;
+
+  try {
+    const res = await axios.post(
+      'https://api.anthropic.com/v1/messages',
+      {
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 30,
+        temperature: 0,
+        system: 'You are a precise B2B data categorization assistant. Respond only in the exact format requested.',
+        messages: [{ role: 'user', content: prompt }]
+      },
+      {
+        headers: {
+          'x-api-key': ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+          'content-type': 'application/json'
+        },
+        timeout: 10000
+      }
+    );
+
+    const text = res.data?.content?.find(p => p.type === 'text')?.text || '';
+    const match = text.match(/^CATEGORY:\s*(.+)$/mi);
+    const category = match ? match[1].trim() : 'Other';
+    return INDUSTRY_CATEGORIES.includes(category) ? category : 'Other';
+  } catch {
+    return 'Other';
   }
-
-  return { companyName, industry, industryCategory };
 }
 
 // =============================
 // WRITE BACK TO HUBSPOT
+// Only writes fields that were actually changed
 // =============================
 async function writeToHubSpot(contactId, companyName, industry, industryCategory) {
-  const properties = {
-    industry,
-    industry_category: industryCategory
-  };
+  const properties = {};
 
-  if (companyName) properties.company = companyName;
+  if (companyName      !== null) properties.company           = companyName;
+  if (industry         !== null) properties.industry          = industry;
+  if (industryCategory !== null) properties.industry_category = industryCategory;
 
-  // Retry HubSpot writes up to 3 times
+  // Nothing to write — all fields were pre-filled
+  if (Object.keys(properties).length === 0) return;
+
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       hsInFlight++;
