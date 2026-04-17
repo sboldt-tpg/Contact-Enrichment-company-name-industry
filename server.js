@@ -52,9 +52,10 @@ const INDUSTRY_CATEGORIES = [
 ];
 
 // =============================
-// DOMAIN CACHE — avoid duplicate Claude calls for same domain
-// domainCache stores: { companyName, industry } — the raw enrichment data
-// industryCategory is always derived fresh from whatever industry we end up using
+// DOMAIN CACHE
+// Stores only what was actually fetched from Claude for a given domain.
+// Fields are only set if Claude was actually asked for them — never '' as a placeholder.
+// Structure: { companyName?: string, industry?: string }
 // =============================
 const domainCache = new Map();
 
@@ -70,8 +71,9 @@ let stats = {
   skipped:      0,
   failed:       0,
   cacheHits:    0,
-  companyKept:  0,  // had company already — skipped that lookup
-  industryKept: 0   // had industry already — skipped that lookup
+  companyKept:  0,
+  industryKept: 0,
+  categoryKept: 0
 };
 
 setInterval(() => {
@@ -106,17 +108,17 @@ app.get('/dashboard', (req, res) => {
       <style>
         body { font-family: monospace; background: #0f0f0f; color: #23cfb0; padding: 40px; }
         h1 { font-size: 18px; margin-bottom: 6px; color: #fff; }
-        .sub { font-size: 12px; color: #444; margin-bottom: 30px; }
+        .sub { font-size: 12px; color: #888; margin-bottom: 30px; }
         .grid { display: flex; gap: 50px; margin-bottom: 40px; flex-wrap: wrap; }
         .stat { font-size: 56px; font-weight: bold; line-height: 1; }
-        .label { font-size: 12px; color: #555; margin-top: 8px; }
+        .label { font-size: 12px; color: #999; margin-top: 8px; }
         .green { color: #a2cf23; } .teal { color: #23cfb0; }
         .orange { color: #f0a500; } .red { color: #e05252; }
-        .grey { color: #333; } .blue { color: #238acf; }
+        .grey { color: #aaa; } .blue { color: #238acf; }
         .yellow { color: #f0d500; }
         .section { margin-bottom: 32px; }
-        .section-title { font-size: 11px; color: #444; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 14px; border-bottom: 1px solid #1a1a1a; padding-bottom: 6px; }
-        .footer { font-size: 12px; color: #333; margin-top: 40px; border-top: 1px solid #1a1a1a; padding-top: 20px; }
+        .section-title { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 14px; border-bottom: 1px solid #1a1a1a; padding-bottom: 6px; }
+        .footer { font-size: 12px; color: #666; margin-top: 40px; border-top: 1px solid #1a1a1a; padding-top: 20px; }
       </style>
     </head>
     <body>
@@ -140,6 +142,7 @@ app.get('/dashboard', (req, res) => {
           <div><div class="stat blue">${stats.cacheHits}</div><div class="label">cache hits</div></div>
           <div><div class="stat yellow">${stats.companyKept}</div><div class="label">company pre-filled</div></div>
           <div><div class="stat yellow">${stats.industryKept}</div><div class="label">industry pre-filled</div></div>
+          <div><div class="stat yellow">${stats.categoryKept}</div><div class="label">category pre-filled</div></div>
           <div><div class="stat ${stats.failed > 0 ? 'red' : 'grey'}">${stats.failed}</div><div class="label">failed</div></div>
         </div>
       </div>
@@ -154,7 +157,6 @@ app.get('/dashboard', (req, res) => {
 // ENQUEUE ENDPOINT
 // =============================
 app.post('/enrich', (req, res) => {
-  // Accept company and industry from the workflow so we know what's already filled
   const { contactId, email, company, industry, industry_category } = req.body;
 
   if (!contactId || !email) {
@@ -201,49 +203,84 @@ setInterval(() => {
 // =============================
 async function processJob(job) {
   try {
-    // Determine what we actually need to look up
     const needsCompany  = !job.existingCompany;
     const needsIndustry = !job.existingIndustry;
-
-    let companyName      = job.existingCompany;
-    let industry         = job.existingIndustry;
+    const needsCategory = !job.existingIndustryCategory;
 
     if (!needsCompany)  stats.companyKept++;
     if (!needsIndustry) stats.industryKept++;
+    if (!needsCategory) stats.categoryKept++;
 
-    // Only call Claude if we need at least one of the two fields
+    let companyName = job.existingCompany;
+    let industry    = job.existingIndustry;
+    let industryCategory = job.existingIndustryCategory;
+
+    // ── Step 1: Resolve company + industry (from cache or Claude) ──
     if (needsCompany || needsIndustry) {
-      if (domainCache.has(job.domain)) {
-        // Pull from cache — take only the fields we actually need
-        const cached = domainCache.get(job.domain);
-        if (needsCompany  && cached.companyName) companyName = cached.companyName;
-        if (needsIndustry && cached.industry)    industry    = cached.industry;
-        stats.cacheHits++;
-        console.log(`💾 Cache hit: ${job.domain} (company=${!needsCompany ? 'kept' : 'from cache'}, industry=${!needsIndustry ? 'kept' : 'from cache'})`);
-      } else {
-        // Ask Claude only for what's missing
-        const result = await runClaude(job, needsCompany, needsIndustry);
-        if (needsCompany)  companyName = result.companyName;
-        if (needsIndustry) industry    = result.industry;
+      const cached = domainCache.get(job.domain);
 
-        // Cache the raw enrichment data for this domain
-        domainCache.set(job.domain, {
-          companyName: needsCompany  ? result.companyName : '',
-          industry:    needsIndustry ? result.industry    : ''
-        });
+      // Check if cache can satisfy everything we need
+      const cacheHasCompany  = cached && cached.companyName;
+      const cacheHasIndustry = cached && cached.industry;
+      const cacheCoversNeeds = (!needsCompany || cacheHasCompany) && (!needsIndustry || cacheHasIndustry);
+
+      if (cached && cacheCoversNeeds) {
+        // Cache fully covers what we need
+        if (needsCompany)  companyName = cached.companyName;
+        if (needsIndustry) industry    = cached.industry;
+        stats.cacheHits++;
+        console.log(`💾 Cache hit: ${job.domain}`);
+      } else {
+        // Need to ask Claude — only ask for fields not already in cache
+        const askCompany  = needsCompany  && !cacheHasCompany;
+        const askIndustry = needsIndustry && !cacheHasIndustry;
+
+        const result = await runClaude(job, askCompany, askIndustry);
+
+        // Apply results
+        if (askCompany)  companyName = result.companyName;
+        if (askIndustry) industry    = result.industry;
+
+        // Pull remaining needed fields from cache if available
+        if (needsCompany  && !askCompany  && cacheHasCompany)  companyName = cached.companyName;
+        if (needsIndustry && !askIndustry && cacheHasIndustry) industry    = cached.industry;
+
+        // Update cache — only store fields we actually fetched; never overwrite with ''
+        const updatedCache = { ...(cached || {}) };
+        if (askCompany  && result.companyName) updatedCache.companyName = result.companyName;
+        if (askIndustry && result.industry)    updatedCache.industry    = result.industry;
+        domainCache.set(job.domain, updatedCache);
       }
     }
 
-    // Industry category — skip if already filled, otherwise derive from industry
-    const industryCategory = job.existingIndustryCategory
-      ? job.existingIndustryCategory
-      : await getIndustryCategory(industry, job.domain);
+    // ── Step 2: Resolve industry category ──
+    if (needsCategory) {
+      // We need an industry value to categorize from — use what we have
+      const industryForCategorization = industry || job.existingIndustry;
+      if (industryForCategorization) {
+        industryCategory = await getIndustryCategory(industryForCategorization, job.domain);
+      } else {
+        // No industry at all — default to Other rather than making a bad API call
+        industryCategory = 'Other';
+        console.warn(`⚠️  No industry available for categorization: ${job.domain} — defaulting to Other`);
+      }
+    }
 
-    const categoryChanged = !job.existingIndustryCategory;
-    await writeToHubSpot(job.contactId, needsCompany ? companyName : null, needsIndustry ? industry : null, categoryChanged ? industryCategory : null);
+    // ── Step 3: Write only changed fields to HubSpot ──
+    await writeToHubSpot(
+      job.contactId,
+      needsCompany  && companyName      ? companyName      : null,
+      needsIndustry && industry         ? industry         : null,
+      needsCategory && industryCategory ? industryCategory : null
+    );
 
     stats.processed++;
-    console.log(`✅ ${job.email} → company="${needsCompany ? companyName : '(kept)'}" / industry="${needsIndustry ? industry : '(kept)'}" / category="${industryCategory}"`);
+    console.log(
+      `✅ ${job.email} → ` +
+      `company="${needsCompany  ? companyName      : '(kept)'}" / ` +
+      `industry="${needsIndustry ? industry         : '(kept)'}" / ` +
+      `category="${needsCategory ? industryCategory : '(kept)'}"`
+    );
 
   } catch (err) {
     console.error(`❌ Failed: ${job.email} — ${err.message}`);
@@ -269,7 +306,6 @@ async function processJob(job) {
 // Only asks for the fields that are actually missing
 // =============================
 async function runClaude(job, needsCompany, needsIndustry) {
-  // Build the prompt dynamically based on what we need
   const tasks = [];
 
   if (needsCompany) {
@@ -321,13 +357,12 @@ ${responseFormat.join('\n')}`;
 
   return {
     companyName: companyMatch  ? companyMatch[1].trim()  : '',
-    industry:    industryMatch ? industryMatch[1].trim() : 'Unknown'
+    industry:    industryMatch ? industryMatch[1].trim() : ''
   };
 }
 
 // =============================
 // CLAUDE — CATEGORIZE INDUSTRY
-// Separate, lightweight call — always runs so category stays in sync
 // =============================
 async function getIndustryCategory(industry, domain) {
   const prompt = `You are a B2B data enrichment assistant.
@@ -382,14 +417,14 @@ CATEGORY: <exact category from the list>`;
 
 // =============================
 // WRITE BACK TO HUBSPOT
-// Only writes fields that were actually changed
+// Only writes fields passed as non-null with a non-empty value
 // =============================
 async function writeToHubSpot(contactId, companyName, industry, industryCategory) {
   const properties = {};
 
-  if (companyName      !== null) properties.company           = companyName;
-  if (industry         !== null) properties.industry          = industry;
-  if (industryCategory !== null) properties.industry_category = industryCategory;
+  if (companyName)      properties.company           = companyName;
+  if (industry)         properties.industry          = industry;
+  if (industryCategory) properties.industry_category = industryCategory;
 
   // Nothing to write — all fields were pre-filled
   if (Object.keys(properties).length === 0) return;
