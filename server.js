@@ -35,6 +35,43 @@ const FREE_EMAIL_DOMAINS = new Set([
 ]);
 
 // =============================
+// PLACEHOLDER VALUES — treat these as blank and re-enrich
+// Lowercase comparison — values are lowercased before checking
+// =============================
+const PLACEHOLDER_COMPANY_VALUES = new Set([
+  'company placeholder',
+  'n/a',
+  'na',
+  'unknown',
+  'none',
+  'not provided',
+  '-',
+  '--',
+  'tbd',
+  'test'
+]);
+
+const PLACEHOLDER_INDUSTRY_VALUES = new Set([
+  'services',       // too vague to be useful
+  'other',
+  'n/a',
+  'na',
+  'unknown',
+  'none',
+  'not provided',
+  '-',
+  '--',
+  'tbd',
+  'test'
+]);
+
+// Helper — returns true if the value is missing or a known placeholder
+function isBlank(value, placeholderSet) {
+  if (!value || !value.trim()) return true;
+  return placeholderSet.has(value.trim().toLowerCase());
+}
+
+// =============================
 // VALID INDUSTRY CATEGORIES
 // =============================
 const INDUSTRY_CATEGORIES = [
@@ -174,13 +211,21 @@ app.post('/enrich', (req, res) => {
     return res.status(200).json({ status: 'skipped', reason: 'personal_email_domain' });
   }
 
+  // Treat placeholder/junk values as blank so they get re-enriched
+  const cleanCompany  = isBlank(company,  PLACEHOLDER_COMPANY_VALUES)  ? '' : company.trim();
+  const cleanIndustry = isBlank(industry, PLACEHOLDER_INDUSTRY_VALUES) ? '' : industry.trim();
+  const cleanCategory = !industry_category || !industry_category.trim() ? '' : industry_category.trim();
+
+  if (cleanCompany  !== (company  || '').trim()) console.log(`🧹 Placeholder company cleared: "${company}" for ${email}`);
+  if (cleanIndustry !== (industry || '').trim()) console.log(`🧹 Placeholder industry cleared: "${industry}" for ${email}`);
+
   queue.push({
     contactId,
     email,
     domain,
-    existingCompany:          company           ? company.trim()           : '',
-    existingIndustry:         industry          ? industry.trim()          : '',
-    existingIndustryCategory: industry_category ? industry_category.trim() : '',
+    existingCompany:          cleanCompany,
+    existingIndustry:         cleanIndustry,
+    existingIndustryCategory: cleanCategory,
     retries: 0
   });
 
@@ -211,8 +256,8 @@ async function processJob(job) {
     if (!needsIndustry) stats.industryKept++;
     if (!needsCategory) stats.categoryKept++;
 
-    let companyName = job.existingCompany;
-    let industry    = job.existingIndustry;
+    let companyName      = job.existingCompany;
+    let industry         = job.existingIndustry;
     let industryCategory = job.existingIndustryCategory;
 
     // ── Step 1: Resolve company + industry (from cache or Claude) ──
@@ -237,7 +282,7 @@ async function processJob(job) {
 
         const result = await runClaude(job, askCompany, askIndustry);
 
-        // Apply results
+        // Apply Claude results
         if (askCompany)  companyName = result.companyName;
         if (askIndustry) industry    = result.industry;
 
@@ -255,12 +300,10 @@ async function processJob(job) {
 
     // ── Step 2: Resolve industry category ──
     if (needsCategory) {
-      // We need an industry value to categorize from — use what we have
       const industryForCategorization = industry || job.existingIndustry;
       if (industryForCategorization) {
         industryCategory = await getIndustryCategory(industryForCategorization, job.domain);
       } else {
-        // No industry at all — default to Other rather than making a bad API call
         industryCategory = 'Other';
         console.warn(`⚠️  No industry available for categorization: ${job.domain} — defaulting to Other`);
       }
